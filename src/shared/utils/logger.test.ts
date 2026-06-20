@@ -18,20 +18,14 @@ describe('Guarded Logger', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     // Reset import.meta.env.PROD to original value
-    Object.defineProperty(import.meta.env, 'PROD', {
-      value: originalProd,
-      configurable: true,
-      writable: true
-    });
+    // @ts-ignore
+    import.meta.env.PROD = originalProd;
   });
 
   describe('when in development (PROD is false)', () => {
     beforeEach(() => {
-      Object.defineProperty(import.meta.env, 'PROD', {
-        value: false,
-        configurable: true,
-        writable: true
-      });
+      // @ts-ignore
+      import.meta.env.PROD = false;
     });
 
     it('should call console.debug when logger.debug is called', () => {
@@ -57,11 +51,8 @@ describe('Guarded Logger', () => {
 
   describe('when in production (PROD is true)', () => {
     beforeEach(() => {
-      Object.defineProperty(import.meta.env, 'PROD', {
-        value: true,
-        configurable: true,
-        writable: true
-      });
+      // @ts-ignore
+      import.meta.env.PROD = true;
     });
 
     it('should NOT call console.debug when logger.debug is called', () => {
