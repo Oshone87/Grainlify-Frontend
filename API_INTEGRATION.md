@@ -114,12 +114,13 @@ const response = await fetch(`${API_BASE_URL}/endpoint`, {
 });
 ```
 
-### Token Expiration
+### Session Lifecycle and Token Expiration
 
-If the backend returns `401 Unauthorized`:
-- Token is expired or invalid
-- Frontend clears the token
-- User is redirected to sign-in page
+The frontend manages JWT session lifecycles automatically:
+- **Expiry Awareness**: The JWT `exp` claim is decoded client-side by `isTokenExpired(token)` (with a 10-second clock skew allowance). If a token is expired or malformed, requests are blocked/cleared proactively.
+- **Silent Session Re-validation**: A registerable `refreshSession()` callback via `AuthContext` tries to re-validate current credentials against `/me` prior to executing a full hard-logout on 401.
+- **401 Retry & Deduplication**: Parallel requests encountering 401 wait on a unified `refreshPromise` so multiple concurrent calls do not trigger multiple logout events or dispatch duplicate custom events.
+- **Tab Focus Sync**: A `visibilitychange` listener triggers re-validation (checking every 60 seconds at most) using a persisted `patchwork_last_validated_at` timestamp.
 
 ## API Client
 

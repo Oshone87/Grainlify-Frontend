@@ -24,6 +24,8 @@ export const setAuthToken = (token: string): void => {
 };
 
 export const removeAuthToken = (): void => {
+  const token = localStorage.getItem("patchwork_jwt");
+  if (token === null) return; // Prevent duplicate logout triggers/events
   localStorage.removeItem("patchwork_jwt");
   if (typeof window !== "undefined") {
     window.dispatchEvent(
@@ -32,9 +34,75 @@ export const removeAuthToken = (): void => {
   }
 };
 
+/**
+ * Decodes the JWT payload to check if the token is expired.
+ * Treating malformed tokens or missing expiration claim as expired.
+ * 
+ * @param token - The JWT string to evaluate.
+ * @returns boolean - True if token is expired or invalid, false otherwise.
+ */
+export const isTokenExpired = (token: string | null): boolean => {
+  if (!token) return true;
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return true;
+
+    // JWT payloads are base64url encoded.
+    const base64Url = parts[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+
+    // Base64 decoding helper that works in browser and Node/Vitest environments
+    const decode = (str: string): string => {
+      if (typeof window !== 'undefined' && typeof window.atob === 'function') {
+        return window.atob(str);
+      }
+      const globalObj: any = typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : {});
+      if (globalObj && 'Buffer' in globalObj) {
+        return globalObj.Buffer.from(str, 'base64').toString('binary');
+      }
+      throw new Error('No base64 decoding function available');
+    };
+
+    const jsonPayload = decodeURIComponent(
+      decode(base64)
+        .split('')
+        .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+
+    const payload = JSON.parse(jsonPayload);
+    if (!payload || typeof payload !== 'object' || !('exp' in payload)) {
+      return true;
+    }
+
+    const exp = Number(payload.exp);
+    if (isNaN(exp)) return true;
+
+    // Proactive check: treat as expired if within 10 seconds of actual expiration (clock skew)
+    const clockSkewSeconds = 10;
+    const currentTimeSeconds = Math.floor(Date.now() / 1000);
+    return currentTimeSeconds + clockSkewSeconds >= exp;
+  } catch {
+    return true;
+  }
+};
+
+// Shared promise for active refresh session to deduplicate concurrent 401 refreshes
+let refreshPromise: Promise<any> | null = null;
+let refreshHandler: (() => Promise<any>) | null = null;
+
+/**
+ * Registers the function responsible for refreshing the user session.
+ * This will be called when a request fails with a 401.
+ */
+export const registerRefreshHandler = (handler: () => Promise<any>): void => {
+  refreshHandler = handler;
+};
+
 // API request helper
 interface ApiRequestOptions extends RequestInit {
   requiresAuth?: boolean;
+  skipRefresh?: boolean;
 }
 
 async function apiRequest<T>(
@@ -44,9 +112,20 @@ async function apiRequest<T>(
   const { requiresAuth = false, headers = {}, ...fetchOptions } = options;
 
   const url = `${API_BASE_URL}${endpoint}`;
-  const requestHeaders: HeadersInit = {
-    ...headers,
-  };
+  const requestHeaders: Record<string, string> = {};
+  if (headers) {
+    if (headers instanceof Headers) {
+      headers.forEach((value, key) => {
+        requestHeaders[key] = value;
+      });
+    } else if (Array.isArray(headers)) {
+      headers.forEach(([key, value]) => {
+        requestHeaders[key] = value;
+      });
+    } else {
+      Object.assign(requestHeaders, headers);
+    }
+  }
 
   // Avoid forcing CORS preflight for simple GET/HEAD requests by only setting
   // Content-Type when we actually send a JSON body.
@@ -90,9 +169,60 @@ async function apiRequest<T>(
   // Handle errors
   if (!response.ok) {
     if (response.status === 401) {
-      // Token expired or invalid - clear it
-      removeAuthToken();
-      throw new Error("Authentication failed. Please sign in again.");
+      if (requiresAuth && refreshHandler && !options.skipRefresh) {
+        if (!refreshPromise) {
+          refreshPromise = refreshHandler().catch((err) => {
+            removeAuthToken();
+            throw err;
+          }).finally(() => {
+            refreshPromise = null;
+          });
+        }
+
+        try {
+          // Wait for the token refresh/validation to complete
+          await refreshPromise;
+        } catch (refreshErr) {
+          throw new Error("Authentication failed. Please sign in again.");
+        }
+
+        const newToken = getAuthToken();
+        if (newToken) {
+          const retriedHeaders = {
+            ...requestHeaders,
+            'Authorization': `Bearer ${newToken}`
+          };
+          try {
+            response = await fetch(url, {
+              ...fetchOptions,
+              headers: retriedHeaders,
+            });
+            if (response.ok) {
+              try {
+                return await response.json() as T;
+              } catch (err) {
+                if (endpoint.includes("/projects/mine") || endpoint.includes("/projects")) {
+                  return [] as T;
+                }
+                throw new Error("Invalid response from server");
+              }
+            }
+          } catch (err) {
+            if (err instanceof TypeError && err.message.includes("fetch")) {
+              throw new Error(
+                "Network error: Unable to connect to the server. Please check your connection.",
+              );
+            }
+            throw err;
+          }
+        }
+      }
+
+      // If we didn't retry or retry failed
+      if (response.status === 401) {
+        removeAuthToken();
+        throw new Error("Authentication failed. Please sign in again.");
+      }
     }
 
     if (response.status === 403) {
@@ -154,7 +284,7 @@ export type LandingStats = {
 export const getLandingStats = () => apiRequest<LandingStats>("/stats/landing");
 
 // Authentication
-export const getCurrentUser = () =>
+export const getCurrentUser = (options?: { skipRefresh?: boolean }) =>
   apiRequest<{
     id: string;
     role: string;
@@ -178,7 +308,7 @@ export const getCurrentUser = () =>
       bio?: string;
       website?: string;
     };
-  }>("/me", { requiresAuth: true });
+  }>("/me", { requiresAuth: true, skipRefresh: options?.skipRefresh });
 
 export const resyncGitHubProfile = () =>
   apiRequest<{
